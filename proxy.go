@@ -16,6 +16,7 @@ import (
 const routeCheckInterval = 30
 
 type listener struct {
+	sync.RWMutex
 	inChan, outChan   chan ndp
 	errChan           chan error
 	ruleIP            net.IP
@@ -27,21 +28,25 @@ type ndp struct {
 	packet gopacket.Packet
 }
 
-func Proxy(parentWg *sync.WaitGroup, ifname string, rules []string) {
-	defer parentWg.Done()
-	upstreams := make(map[string]*listener)
+func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
+	defer wg.Done()
 
+	var err error
+	upstreams := make(map[string]*listener)
 	// shared channel upstreams send to
 	errChan := make(chan error)
 	outChan := make(chan ndp)
 	mainInChan := make(chan ndp)
-	go Listen(ifname, &listener{outChan: outChan, inChan: mainInChan})
 	tickChan := time.NewTicker(time.Second * routeCheckInterval).C
-	err := refresh(rules, outChan, errChan, upstreams)
+
+	go Listen(ifname, &listener{outChan: outChan, inChan: mainInChan, errChan: errChan})
+
+	err = refresh(rules, outChan, errChan, upstreams)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return
 	}
+
 	for {
 		select {
 		case err = <-errChan:
@@ -100,6 +105,7 @@ func refresh(rules []string, outChan chan ndp, errChan chan error, upstreams map
 		}
 	}
 	for name, listener := range upstreams {
+		listener.RLock()
 		if !listener.started {
 			listener.outChan = outChan
 			listener.errChan = errChan
@@ -108,9 +114,9 @@ func refresh(rules []string, outChan chan ndp, errChan chan error, upstreams map
 		if listener.finished {
 			delete(upstreams, name)
 		}
+		listener.RUnlock()
 	}
 	return nil
-
 }
 
 // inChan carries messages to be sent from this interface
@@ -119,9 +125,13 @@ func Listen(ifname string, listener *listener) {
 	var err error
 	var handle *pcap.Handle
 	log.Printf("Spawning listener for if %s\n", ifname)
+	listener.Lock()
 	listener.started = true
+	listener.Unlock()
 	defer func() {
+		listener.Lock()
 		listener.finished = true
+		listener.Unlock()
 		if err != nil {
 			listener.errChan <- err
 		}
