@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -12,101 +13,183 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-const routeRefreshInterval = 30
+const routeCheckInterval = 30
+
+type listener struct {
+	inChan, outChan   chan ndp
+	errChan           chan error
+	ruleIP            net.IP
+	started, finished bool
+}
 
 type ndp struct {
-	typ   uint8
-	iface string
+	ifname string
+	packet gopacket.Packet
 }
 
-type iface struct {
-	name      string
-	relayChan chan ndp
-}
+func Proxy(parentWg *sync.WaitGroup, ifname string, rules []string) {
+	defer parentWg.Done()
+	upstreams := make(map[string]*listener)
 
-func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
-
-	defer wg.Done()
-	var upstreams []iface
-	lastRefresh := time.Now()
-
-	mainif := iface{name: ifname, relayChan: make(chan ndp)}
-	go Listen(mainif, nil)
+	// shared channel upstreams send to
+	errChan := make(chan error)
+	outChan := make(chan ndp)
+	mainInChan := make(chan ndp)
+	go Listen(ifname, &listener{outChan: outChan, inChan: mainInChan})
+	tickChan := time.NewTicker(time.Second * routeCheckInterval).C
+	err := refresh(rules, outChan, errChan, upstreams)
+	if err != nil {
+		fmt.Printf("%s\n", err)
+		return
+	}
 	for {
-		if time.Since(lastRefresh) >= time.Duration(routeRefreshInterval)*time.Second {
-			for _, rule := range rules {
-				ip, _, err := net.ParseCIDR(rule)
-				if err != nil {
-					fmt.Printf("Invalid rule '%s', error: %s\n", rule, err)
-					return
-				}
-				routes, err := netlink.RouteGet(ip)
-				if err != nil || len(routes) == 0 {
-					// route not found, skip
-					continue
-				}
-				links, err := netlink.LinkList()
-				if err != nil {
-					fmt.Printf("Error enumerating links, error: %s\n", err)
-					return
-				}
-				for _, link := range links {
-					for _, route := range routes {
-						if link.Attrs().Index == route.LinkIndex {
-							iff := iface{name: link.Attrs().Name, relayChan: make(chan ndp)}
-							upstreams = append(upstreams, iff)
-						}
-					}
-				}
-			}
-			for _, upstream := range upstreams {
-				go Listen(upstream, mainif.relayChan)
-			}
-			lastRefresh = time.Now()
-		}
-
 		select {
-		case n := <-mainif.relayChan:
-
+		case err = <-errChan:
+			fmt.Printf("%s\n", err)
+			return
+		case n := <-outChan:
+			// if msg arrived from the main interface, then send to all upstreams
+			if n.ifname == ifname {
+				for _, upstream := range upstreams {
+					upstream.inChan <- n
+				}
+			} else { // otherwise send to main interface
+				mainInChan <- n
+			}
+		case <-tickChan:
+			err := refresh(rules, outChan, errChan, upstreams)
+			if err != nil {
+				fmt.Printf("%s\n", err)
+				return
+			}
 		}
-
 	}
 }
 
-func Listen(iff iface, ndpChan chan ndp) {
-	var eth layers.Ethernet
+func refresh(rules []string, outChan chan ndp, errChan chan error, upstreams map[string]*listener) error {
+	log.Printf("Refreshing routes...")
+	for _, rule := range rules {
+		ruleIP, _, err := net.ParseCIDR(rule)
+		if err != nil {
+			return fmt.Errorf("invalid rule '%s', %s", rule, err)
+		}
+		routes, err := netlink.RouteGet(ruleIP)
+		if err != nil || len(routes) == 0 {
+			// cancel any proxies for removed routes
+			for _, upstream := range upstreams {
+				if upstream.ruleIP.Equal(ruleIP) {
+					close(upstream.inChan)
+				}
+			}
+			// route not found, skip
+			continue
+		}
+		links, err := netlink.LinkList()
+		if err != nil {
+			return fmt.Errorf("error enumerating links, %s", err)
+		}
+		for _, link := range links {
+			for _, route := range routes {
+				if link.Attrs().Index == route.LinkIndex && route.Gw == nil {
+					if _, ok := upstreams[link.Attrs().Name]; !ok {
+						log.Printf("New upstream for link %s, rule %s, route %v\n", link.Attrs().Name, rule, route)
+						upstreams[link.Attrs().Name] = &listener{inChan: make(chan ndp), ruleIP: ruleIP}
+					}
+				}
+			}
+		}
+	}
+	for name, listener := range upstreams {
+		if !listener.started {
+			listener.outChan = outChan
+			listener.errChan = errChan
+			go Listen(name, listener)
+		}
+		if listener.finished {
+			delete(upstreams, name)
+		}
+	}
+	return nil
+
+}
+
+// inChan carries messages to be sent from this interface
+// outChan carries messages read from interface
+func Listen(ifname string, listener *listener) {
+	var err error
+	var handle *pcap.Handle
+	log.Printf("Spawning listener for if %s\n", ifname)
+	listener.started = true
+	defer func() {
+		listener.finished = true
+		if err != nil {
+			listener.errChan <- err
+		}
+	}()
+
+	handle, err = pcap.OpenLive(ifname, snaplen, true, 0)
+	if err != nil {
+		err = fmt.Errorf("pcap open error: %s", err)
+		return
+	}
+	defer handle.Close()
+
 	var ip6 layers.IPv6
 	var icmp layers.ICMPv6
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &icmp)
 	decoded := []gopacket.LayerType{}
-	if handle, err := pcap.OpenLive(iff.name, snaplen, true, 0); err != nil {
-		fmt.Printf("pcap open error: %s\n", err)
-		return
-	} else {
-		packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-		for packet := range packetSource.Packets() {
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ip6, &icmp)
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	packetsChan := packetSource.Packets()
+	for {
+		select {
+		case packet := <-packetsChan:
 			parser.DecodeLayers(packet.Data(), &decoded)
 			for _, layerType := range decoded {
 				switch layerType {
 				case layers.LayerTypeICMPv6:
 					// bigendian to littlendian
 					typ := uint8(icmp.TypeCode >> 8)
-					var target net.IP
-					// do we have a payload large enough to hold an IPv6 address?
-					if len(icmp.BaseLayer.Payload) >= 16 {
-						target = net.IP(icmp.BaseLayer.Payload[:16])
-					} else {
-						target = net.IP(icmp.BaseLayer.Payload)
-					}
 					switch typ {
-					case layers.ICMPv6TypeNeighborSolicitation:
-						fmt.Printf("Solicit target %s, src %s, dst %s\n", target, ip6.SrcIP, ip6.DstIP)
-						ndpChan <- ndp{layers.ICMPv6TypeNeighborSolicitation, iff.name}
-					case layers.ICMPv6TypeNeighborAdvertisement:
-						fmt.Printf("Advertise target %s, src %s, dst %s\n", target, ip6.SrcIP, ip6.DstIP)
-						ndpChan <- ndp{layers.ICMPv6TypeNeighborAdvertisement, iff.name}
+					case layers.ICMPv6TypeNeighborSolicitation, layers.ICMPv6TypeNeighborAdvertisement:
+						n := ndp{packet: packet, ifname: ifname}
+						log.Printf("%s: read ndp %v\n", ifname, n)
+						listener.outChan <- n
 					}
 				}
+			}
+
+		case n, ok := <-listener.inChan:
+			/*
+				parser.DecodeLayers(n.packet.Data(), &decoded)
+				for _, layerType := range decoded {
+					switch layerType {
+					case layers.LayerTypeICMPv6:
+						// bigendian to littlendian
+						typ := uint8(icmp.TypeCode >> 8)
+
+						var target net.IP
+						// do we have a payload large enough to hold an IPv6 address?
+						if len(icmp.BaseLayer.Payload) >= 16 {
+							target = net.IP(icmp.BaseLayer.Payload[:16])
+						} else {
+							target = net.IP(icmp.BaseLayer.Payload)
+						}
+						switch typ {
+						case layers.ICMPv6TypeNeighborSolicitation, layers.ICMPv6TypeNeighborAdvertisement:
+							outChan <- ndp{packet: packet, ifname: ifname}
+						}
+					}
+				}
+			*/
+			if ok {
+				err = handle.WritePacketData(n.packet.Data())
+				if err != nil {
+					err = fmt.Errorf("pcap write error: %s", err)
+					return
+				}
+				log.Printf("%s: wrote ndp %v\n", ifname, n)
+			} else {
+				return
 			}
 		}
 	}

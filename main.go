@@ -23,23 +23,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("config %#v\n", conf)
+	//fmt.Printf("config %#v\n", conf)
 
 	var wg sync.WaitGroup
 	for ifaceName, iface := range conf.Interfaces {
-		link, err := netlink.LinkByName(ifaceName)
+		_, err := netlink.LinkByName(ifaceName)
 		if err != nil {
 			fmt.Printf("Ignoring link '%s', error: %s\n", iface, err)
 			continue
 		}
 		wg.Add(1)
 		go Proxy(&wg, ifaceName, iface.Rules)
-		var routes []netlink.Route
-		if routes, err = netlink.RouteList(link, netlink.FAMILY_V6); err != nil {
-			fmt.Printf("%s\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("routes %v\n", routes)
 	}
 	wg.Wait()
 }
