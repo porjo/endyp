@@ -19,7 +19,7 @@ type listener struct {
 	sync.RWMutex
 	inChan, outChan   chan ndp
 	errChan           chan error
-	ruleIP            net.IP
+	ruleNet           *net.IPNet
 	started, finished bool
 }
 
@@ -74,15 +74,15 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 func refresh(rules []string, outChan chan ndp, errChan chan error, upstreams map[string]*listener) error {
 	log.Printf("Refreshing routes...")
 	for _, rule := range rules {
-		ruleIP, _, err := net.ParseCIDR(rule)
+		_, ruleNet, err := net.ParseCIDR(rule)
 		if err != nil {
 			return fmt.Errorf("invalid rule '%s', %s", rule, err)
 		}
-		routes, err := netlink.RouteGet(ruleIP)
+		routes, err := netlink.RouteGet(ruleNet.IP)
 		if err != nil || len(routes) == 0 {
 			// cancel any proxies for removed routes
 			for _, upstream := range upstreams {
-				if upstream.ruleIP.Equal(ruleIP) {
+				if upstream.ruleNet.IP.Equal(ruleNet.IP) {
 					close(upstream.inChan)
 				}
 			}
@@ -98,7 +98,7 @@ func refresh(rules []string, outChan chan ndp, errChan chan error, upstreams map
 				if link.Attrs().Index == route.LinkIndex && route.Gw == nil {
 					if _, ok := upstreams[link.Attrs().Name]; !ok {
 						log.Printf("New upstream for link %s, rule %s, route %v\n", link.Attrs().Name, rule, route)
-						upstreams[link.Attrs().Name] = &listener{inChan: make(chan ndp), ruleIP: ruleIP}
+						upstreams[link.Attrs().Name] = &listener{inChan: make(chan ndp), ruleNet: ruleNet}
 					}
 				}
 			}
@@ -144,10 +144,11 @@ func Listen(ifname string, listener *listener) {
 	}
 	defer handle.Close()
 
+	var eth layers.Ethernet
 	var ip6 layers.IPv6
 	var icmp layers.ICMPv6
 	decoded := []gopacket.LayerType{}
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &ip6, &icmp)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &icmp)
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	packetsChan := packetSource.Packets()
 	for {
@@ -191,6 +192,18 @@ func Listen(ifname string, listener *listener) {
 					}
 				}
 			*/
+			var target net.IP
+			// IPv6 address bounds check
+			if len(icmp.BaseLayer.Payload) >= 16 {
+				target = net.IP(icmp.BaseLayer.Payload[:16])
+			} else {
+				continue
+			}
+
+			// skip this packet if target isn't within this listener's associated rule network
+			if !listener.ruleNet.Contains(target) {
+				continue
+			}
 			if ok {
 				err = handle.WritePacketData(n.packet.Data())
 				if err != nil {
