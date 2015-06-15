@@ -25,7 +25,9 @@ type listener struct {
 
 type ndp struct {
 	ifname string
-	packet gopacket.Packet
+	icmp   layers.ICMPv6
+	ip6    layers.IPv6
+	eth    layers.Ethernet
 }
 
 func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
@@ -39,9 +41,9 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	mainInChan := make(chan ndp)
 	tickChan := time.NewTicker(time.Second * routeCheckInterval).C
 
-	go Listen(ifname, &listener{outChan: outChan, inChan: mainInChan, errChan: errChan})
+	go handler(ifname, &listener{outChan: outChan, inChan: mainInChan, errChan: errChan})
 
-	err = refresh(rules, outChan, errChan, upstreams)
+	err = refreshRoutes(rules, outChan, errChan, upstreams)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return
@@ -53,16 +55,26 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 			fmt.Printf("%s\n", err)
 			return
 		case n := <-outChan:
-			// if msg arrived from the main interface, then send to all upstreams
+			var target net.IP
+			// IPv6 bounds check
+			if len(n.icmp.BaseLayer.Payload) >= 16 {
+				target = net.IP(n.icmp.BaseLayer.Payload[:16])
+			} else {
+				continue
+			}
+			// if msg arrived from the main interface, then send to matching upstreams
 			if n.ifname == ifname {
 				for _, upstream := range upstreams {
-					upstream.inChan <- n
+					if upstream.ruleNet.Contains(target) {
+						upstream.inChan <- n
+						continue
+					}
 				}
 			} else { // otherwise send to main interface
 				mainInChan <- n
 			}
 		case <-tickChan:
-			err := refresh(rules, outChan, errChan, upstreams)
+			err := refreshRoutes(rules, outChan, errChan, upstreams)
 			if err != nil {
 				fmt.Printf("%s\n", err)
 				return
@@ -71,7 +83,7 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	}
 }
 
-func refresh(rules []string, outChan chan ndp, errChan chan error, upstreams map[string]*listener) error {
+func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstreams map[string]*listener) error {
 	log.Printf("Refreshing routes...")
 	for _, rule := range rules {
 		_, ruleNet, err := net.ParseCIDR(rule)
@@ -109,7 +121,7 @@ func refresh(rules []string, outChan chan ndp, errChan chan error, upstreams map
 		if !listener.started {
 			listener.outChan = outChan
 			listener.errChan = errChan
-			go Listen(name, listener)
+			go handler(name, listener)
 		}
 		if listener.finished {
 			delete(upstreams, name)
@@ -121,7 +133,7 @@ func refresh(rules []string, outChan chan ndp, errChan chan error, upstreams map
 
 // inChan carries messages to be sent from this interface
 // outChan carries messages read from interface
-func Listen(ifname string, listener *listener) {
+func handler(ifname string, listener *listener) {
 	var err error
 	var handle *pcap.Handle
 	log.Printf("Spawning listener for if %s\n", ifname)
@@ -144,6 +156,12 @@ func Listen(ifname string, listener *listener) {
 	}
 	defer handle.Close()
 
+	var iface *net.Interface
+	iface, err = net.InterfaceByName(ifname)
+	if err != nil {
+		return
+	}
+
 	var eth layers.Ethernet
 	var ip6 layers.IPv6
 	var icmp layers.ICMPv6
@@ -162,7 +180,7 @@ func Listen(ifname string, listener *listener) {
 					typ := uint8(icmp.TypeCode >> 8)
 					switch typ {
 					case layers.ICMPv6TypeNeighborSolicitation, layers.ICMPv6TypeNeighborAdvertisement:
-						n := ndp{packet: packet, ifname: ifname}
+						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname}
 						log.Printf("%s: read ndp %v\n", ifname, n)
 						listener.outChan <- n
 					}
@@ -170,42 +188,16 @@ func Listen(ifname string, listener *listener) {
 			}
 
 		case n, ok := <-listener.inChan:
-			/*
-				parser.DecodeLayers(n.packet.Data(), &decoded)
-				for _, layerType := range decoded {
-					switch layerType {
-					case layers.LayerTypeICMPv6:
-						// bigendian to littlendian
-						typ := uint8(icmp.TypeCode >> 8)
+			eth := n.eth
+			eth.SrcMAC = iface.HardwareAddr
+			ipv6 := n.ip6
+			ipv6.SrcIP = net.IP{} // unspecified
+			buf := gopacket.NewSerializeBuffer()
+			opts := gopacket.SerializeOptions{}
+			gopacket.SerializeLayers(buf, opts, &eth, &ipv6, &n.icmp)
 
-						var target net.IP
-						// do we have a payload large enough to hold an IPv6 address?
-						if len(icmp.BaseLayer.Payload) >= 16 {
-							target = net.IP(icmp.BaseLayer.Payload[:16])
-						} else {
-							target = net.IP(icmp.BaseLayer.Payload)
-						}
-						switch typ {
-						case layers.ICMPv6TypeNeighborSolicitation, layers.ICMPv6TypeNeighborAdvertisement:
-							outChan <- ndp{packet: packet, ifname: ifname}
-						}
-					}
-				}
-			*/
-			var target net.IP
-			// IPv6 address bounds check
-			if len(icmp.BaseLayer.Payload) >= 16 {
-				target = net.IP(icmp.BaseLayer.Payload[:16])
-			} else {
-				continue
-			}
-
-			// skip this packet if target isn't within this listener's associated rule network
-			if !listener.ruleNet.Contains(target) {
-				continue
-			}
 			if ok {
-				err = handle.WritePacketData(n.packet.Data())
+				err = handle.WritePacketData(buf.Bytes())
 				if err != nil {
 					err = fmt.Errorf("pcap write error: %s", err)
 					return
