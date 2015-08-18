@@ -204,16 +204,15 @@ func handler(ifname string, listener *listener) {
 					} else {
 						continue
 					}
-					// bigendian to littlendian
-					typ := uint8(icmp.TypeCode >> 8)
-					switch typ {
+
+					switch icmp.TypeCode.Type() {
 					case layers.ICMPv6TypeNeighborSolicitation:
 						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname}
-						log.Printf("%s: read ndp solicit, ip6 src %s, dst %s, target %s\n", ifname, ip6.SrcIP, ip6.DstIP, target)
+						log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
 						listener.outChan <- n
 					case layers.ICMPv6TypeNeighborAdvertisement:
 						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname}
-						log.Printf("%s: read ndp advert, ip6 src %s, dst %s, target %s\n", ifname, ip6.SrcIP, ip6.DstIP, target)
+						log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
 						listener.outChan <- n
 					}
 				}
@@ -225,8 +224,13 @@ func handler(ifname string, listener *listener) {
 			ipv6 := n.ip6
 			ipv6.SrcIP = linklocal
 			buf := gopacket.NewSerializeBuffer()
+			//opts := gopacket.SerializeOptions{ComputeChecksums: true}
 			opts := gopacket.SerializeOptions{}
-			gopacket.SerializeLayers(buf, opts, &eth, &ipv6, &n.icmp)
+			err = gopacket.SerializeLayers(buf, opts, &eth, &ipv6, &n.icmp)
+			if err != nil {
+				err = fmt.Errorf("serialize layers error: %s", err)
+				return
+			}
 
 			if ok {
 				err = handle.WritePacketData(buf.Bytes())
@@ -234,7 +238,7 @@ func handler(ifname string, listener *listener) {
 					err = fmt.Errorf("pcap write error: %s", err)
 					return
 				}
-				log.Printf("%s: write ndp, ip6 src %s, dst %s\n", ifname, ipv6.SrcIP, ipv6.DstIP)
+				log.Printf("%s: write ndp %s, ip6 src %s, dst %s, target %s\n", ifname, n.icmp.TypeCode, ipv6.SrcIP, ipv6.DstIP, net.IP(n.icmp.BaseLayer.Payload[:16]))
 			} else {
 				return
 			}

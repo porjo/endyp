@@ -9,7 +9,7 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// spanlen should be large enough to capture the layers we're interested in
+// snaplen should be large enough to capture the layers we're interested in
 const snaplen = 100
 
 var confFile = flag.String("c", "config.toml", "config file")
