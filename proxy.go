@@ -24,10 +24,11 @@ type listener struct {
 }
 
 type ndp struct {
-	ifname string
-	icmp   layers.ICMPv6
-	ip6    layers.IPv6
-	eth    layers.Ethernet
+	ifname  string
+	payload gopacket.Payload
+	icmp    layers.ICMPv6
+	ip6     layers.IPv6
+	eth     layers.Ethernet
 }
 
 func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
@@ -57,8 +58,8 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 		case n := <-outChan:
 			var target net.IP
 			// IPv6 bounds check
-			if len(n.icmp.BaseLayer.Payload) >= 16 {
-				target = net.IP(n.icmp.BaseLayer.Payload[:16])
+			if len(n.payload) >= 16 {
+				target = net.IP(n.payload[:16])
 			} else {
 				continue
 			}
@@ -140,6 +141,13 @@ func handler(ifname string, listener *listener) {
 	listener.Lock()
 	listener.started = true
 	listener.Unlock()
+
+	handle, err = pcap.OpenLive(ifname, snaplen, true, 0)
+	if err != nil {
+		err = fmt.Errorf("pcap open error: %s", err)
+		return
+	}
+	defer handle.Close()
 	defer func() {
 		listener.Lock()
 		listener.finished = true
@@ -148,13 +156,6 @@ func handler(ifname string, listener *listener) {
 			listener.errChan <- err
 		}
 	}()
-
-	handle, err = pcap.OpenLive(ifname, snaplen, true, 0)
-	if err != nil {
-		err = fmt.Errorf("pcap open error: %s", err)
-		return
-	}
-	defer handle.Close()
 
 	var iface *net.Interface
 	iface, err = net.InterfaceByName(ifname)
@@ -186,8 +187,9 @@ func handler(ifname string, listener *listener) {
 	var eth layers.Ethernet
 	var ip6 layers.IPv6
 	var icmp layers.ICMPv6
+	var payload gopacket.Payload
 	decoded := []gopacket.LayerType{}
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &icmp)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &icmp, &payload)
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	packetsChan := packetSource.Packets()
 	for {
@@ -197,51 +199,65 @@ func handler(ifname string, listener *listener) {
 			for _, layerType := range decoded {
 				switch layerType {
 				case layers.LayerTypeICMPv6:
+
 					var target net.IP
 					// IPv6 bounds check
-					if len(icmp.BaseLayer.Payload) >= 16 {
-						target = net.IP(icmp.BaseLayer.Payload[:16])
+					if len(payload) >= 16 {
+						target = net.IP(payload[:16])
 					} else {
 						continue
 					}
 
 					switch icmp.TypeCode.Type() {
 					case layers.ICMPv6TypeNeighborSolicitation:
-						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname}
+						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname, payload: payload}
 						log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
+						log.Printf("in payload %x", payload.Payload())
 						listener.outChan <- n
 					case layers.ICMPv6TypeNeighborAdvertisement:
-						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname}
+						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname, payload: payload}
 						log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
+						log.Printf("in payload %x", payload.Payload())
 						listener.outChan <- n
 					}
 				}
 			}
 
 		case n, ok := <-listener.inChan:
+			if !ok {
+				return
+			}
 			eth := n.eth
 			eth.SrcMAC = iface.HardwareAddr
 			ipv6 := n.ip6
 			ipv6.SrcIP = linklocal
 			buf := gopacket.NewSerializeBuffer()
-			//opts := gopacket.SerializeOptions{ComputeChecksums: true}
-			opts := gopacket.SerializeOptions{}
-			err = gopacket.SerializeLayers(buf, opts, &eth, &ipv6, &n.icmp)
+			n.icmp.SetNetworkLayerForChecksum(&ipv6)
+			opts := gopacket.SerializeOptions{ComputeChecksums: true}
+			//opts := gopacket.SerializeOptions{}
+			switch n.icmp.TypeCode.Type() {
+			case layers.ICMPv6TypeNeighborSolicitation:
+				// ND solicit opt type, opt length
+				n.payload = append(n.payload[:16], 0x01, 0x01)
+				n.payload = append(n.payload[:18], iface.HardwareAddr...)
+			case layers.ICMPv6TypeNeighborAdvertisement:
+				// ND advert opt type, opt length
+				n.payload = append(n.payload[:16], 0x02, 0x01)
+				n.payload = append(n.payload[:18], iface.HardwareAddr...)
+			}
+			err = gopacket.SerializeLayers(buf, opts, &eth, &ipv6, &n.icmp, &n.payload)
 			if err != nil {
 				err = fmt.Errorf("serialize layers error: %s", err)
 				return
 			}
 
-			if ok {
-				err = handle.WritePacketData(buf.Bytes())
-				if err != nil {
-					err = fmt.Errorf("pcap write error: %s", err)
-					return
-				}
-				log.Printf("%s: write ndp %s, ip6 src %s, dst %s, target %s\n", ifname, n.icmp.TypeCode, ipv6.SrcIP, ipv6.DstIP, net.IP(n.icmp.BaseLayer.Payload[:16]))
-			} else {
+			err = handle.WritePacketData(buf.Bytes())
+			if err != nil {
+				err = fmt.Errorf("pcap write error: %s", err)
 				return
 			}
+			log.Printf("%s: write ndp %s, ip6 src %s, dst %s, target %s\n", ifname, n.icmp.TypeCode, ipv6.SrcIP, ipv6.DstIP, net.IP(n.payload[:16]))
+			log.Printf("out payload %x", n.payload.Payload())
 		}
 	}
 }
