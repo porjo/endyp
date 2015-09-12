@@ -1,8 +1,8 @@
 # endyp
 
-An NDP proxy daemon. Inspired by [ndppd](https://github.com/DanielAdolfsson/ndppd)
+An NDP proxy daemon, inspired by [ndppd](https://github.com/DanielAdolfsson/ndppd).
 
-Many VPS providers will give you an IPv6 subnet but rather than route it to you, they put it 'on link'. This makes it hard to use IPv6 with things like Docker. An NDP proxy solves this problem by 'bridging' the Docker network with the outside network. You could bridget the 2 networks on an ethernet layer, however many VPS providers filter traffic based on source MAC address, so packets that are not originating from your VPS's MAC will be dropped. Again, an NDP proxy solves that problem too as all packets originate use your VPS's MAC address (rather than the MAC assigned to your container).
+Many VPS providers will give you an IPv6 subnet but rather than being routed, it is put 'on link'. This makes it hard to use IPv6 for things like Docker. An NDP proxy solves this problem by 'bridging' the Docker network with the outside network. You could bridge the two networks at an ethernet layer, however many VPS providers also filter traffic based on source MAC address, so packets that are not originating from your VPS's MAC will be dropped. An NDP proxy solves that problem too as all packets will have the VPS's 'outside' interface MAC address (rather than the MAC assigned of the originating container).
 
 Written as a learning exercise. It works, but shouldn't be relied on.
 
