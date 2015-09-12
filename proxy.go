@@ -1,3 +1,19 @@
+/*
+   Copyright 2015 Ian Bishop
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+*/
+
 package main
 
 import (
@@ -90,7 +106,6 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 }
 
 func proxyPacket(ifname string, n ndp, mainInChan, outChan chan ndp, upstreams map[string]*listener, sessions []session) []session {
-
 	var target net.IP
 	// IPv6 bounds check
 	if len(n.payload) >= 16 {
@@ -106,38 +121,32 @@ func proxyPacket(ifname string, n ndp, mainInChan, outChan chan ndp, upstreams m
 			if s.target.Equal(target) {
 				sessions[i].status = valid
 				n.ip6.DstIP = s.srcIP
-				log.Printf("proxy advert, send")
 				mainInChan <- n
 				return sessions
 			}
 		}
-		log.Printf("proxy advert, no sess")
 	case layers.ICMPv6TypeNeighborSolicitation:
 		if !n.ip6.DstIP.IsMulticast() {
 			return sessions
 		}
 		for _, s := range sessions {
 			if s.target.Equal(target) {
-				log.Printf("proxy solicit, found sess")
 
 				switch s.status {
 				case waiting:
 				case invalid:
 					break
 				case valid:
-					log.Printf("proxy solicit, found sess, send")
 					s.upstream.inChan <- n
 				}
 				return sessions
 			}
 		}
 
-		log.Printf("proxy solicit, no sess")
 		var s *session
 		// if msg arrived from the main interface, then send to matching upstreams
 		for _, upstream := range upstreams {
 			if upstream.ruleNet.Contains(target) {
-				log.Printf("proxy solicit, no sess, new")
 				s = &session{
 					upstream: upstream,
 					srcIP:    n.ip6.SrcIP,
@@ -151,7 +160,6 @@ func proxyPacket(ifname string, n ndp, mainInChan, outChan chan ndp, upstreams m
 
 		if s != nil {
 			sessions = append(sessions, *s)
-			log.Printf("proxy solicit, no sess, send")
 			s.upstream.inChan <- n
 		}
 	}
@@ -245,12 +253,6 @@ func handler(ifname string, listener *listener) {
 	listener.started = true
 	listener.Unlock()
 
-	handle, err = pcap.OpenLive(ifname, snaplen, true, 0)
-	if err != nil {
-		err = fmt.Errorf("pcap open error: %s", err)
-		return
-	}
-	defer handle.Close()
 	defer func() {
 		listener.Lock()
 		listener.finished = true
@@ -258,6 +260,16 @@ func handler(ifname string, listener *listener) {
 		if err != nil {
 			listener.errChan <- err
 		}
+	}()
+
+	handle, err = pcap.OpenLive(ifname, snaplen, true, 0)
+	if err != nil {
+		err = fmt.Errorf("pcap open error: %s", err)
+		return
+	}
+	defer handle.Close()
+	defer func() {
+		log.Printf("%s: handler exit %s", ifname, err)
 	}()
 
 	var iface *net.Interface
@@ -330,14 +342,20 @@ func handler(ifname string, listener *listener) {
 				return
 			}
 			eth := n.eth
-			neighs, err := netlink.NeighList(iface.Index, netlink.FAMILY_V6)
+			var neighbors []netlink.Neigh
+			neighbors, err = netlink.NeighList(iface.Index, netlink.FAMILY_V6)
 			if err != nil {
 				return
 			}
-			for _, neigh := range neighs {
-				if neigh.IP.Equal(n.ip6.DstIP) {
-					eth.DstMAC = neigh.HardwareAddr
+			eth.DstMAC = nil
+			for _, neighbor := range neighbors {
+				if neighbor.IP.Equal(n.ip6.DstIP) {
+					eth.DstMAC = neighbor.HardwareAddr
 				}
+			}
+			if eth.DstMAC == nil {
+				err = fmt.Errorf("could not find destination MAC address for IP %s", n.ip6.DstIP)
+				return
 			}
 			eth.SrcMAC = iface.HardwareAddr
 			ipv6 := n.ip6
@@ -345,18 +363,17 @@ func handler(ifname string, listener *listener) {
 			buf := gopacket.NewSerializeBuffer()
 			n.icmp.SetNetworkLayerForChecksum(&ipv6)
 			opts := gopacket.SerializeOptions{ComputeChecksums: true}
-			//opts := gopacket.SerializeOptions{}
 			switch n.icmp.TypeCode.Type() {
 			case layers.ICMPv6TypeNeighborSolicitation:
 				// ND solicit opt type, opt length
 				n.payload = append(n.payload[:16], 0x01, 0x01)
-				n.payload = append(n.payload[:18], iface.HardwareAddr...)
 			case layers.ICMPv6TypeNeighborAdvertisement:
 				// ND advert opt type, opt length
 				n.payload = append(n.payload[:16], 0x02, 0x01)
-				n.payload = append(n.payload[:18], iface.HardwareAddr...)
 				n.icmp.TypeBytes[0] = 0xc0 // router,solicit,override flags
 			}
+			n.payload = append(n.payload[:18], iface.HardwareAddr...)
+
 			err = gopacket.SerializeLayers(buf, opts, &eth, &ipv6, &n.icmp, &n.payload)
 			if err != nil {
 				err = fmt.Errorf("serialize layers error: %s", err)
