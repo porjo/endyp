@@ -23,6 +23,15 @@ type listener struct {
 	started, finished bool
 }
 
+type sessionStatus int
+
+// sessions track clients who've previously sent neighbor solicits
+type session struct {
+	srcIP, dstIP, target net.IP
+	status               sessionStatus
+	ttl                  time.Duration
+}
+
 type ndp struct {
 	ifname  string
 	payload gopacket.Payload
@@ -31,17 +40,28 @@ type ndp struct {
 	eth     layers.Ethernet
 }
 
+const (
+	waiting sessionStatus = iota
+	valid
+	invalid
+
+	ttl = time.Duration(500 * time.Millisecond)
+)
+
 func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	defer wg.Done()
 
 	var err error
 	upstreams := make(map[string]*listener)
-	// shared channel upstreams send to
+	// shared channels upstreams send to
 	errChan := make(chan error)
 	outChan := make(chan ndp)
 	mainInChan := make(chan ndp)
 	tickChan := time.NewTicker(time.Second * routeCheckInterval).C
 
+	var sessions []session
+
+	// launch handler for main interface 'ifname'
 	go handler(ifname, &listener{outChan: outChan, inChan: mainInChan, errChan: errChan})
 
 	err = refreshRoutes(rules, outChan, errChan, upstreams)
@@ -63,18 +83,44 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 			} else {
 				continue
 			}
+
 			// if msg arrived from the main interface, then send to matching upstreams
 			if n.ifname == ifname {
 				for _, upstream := range upstreams {
 					if upstream.ruleNet.Contains(target) {
+						if n.icmp.TypeCode.Type() == layers.ICMPv6TypeNeighborSolicitation {
+							match := false
+							for _, s := range sessions {
+								if s.target.Equal(target) {
+
+									switch s.status {
+									case waiting:
+									case invalid:
+										break
+									case valid:
+										match = true
+									}
+								}
+							}
+						}
 						upstream.inChan <- n
 						continue
 					}
 				}
 			} else { // otherwise send to main interface
-				mainInChan <- n
+				if n.icmp.TypeCode.Type() == layers.ICMPv6TypeNeighborAdvertisement {
+					for _, s := range sessions {
+						if s.target.Equal(target) {
+							match = true
+							n.ip6.DstIP = s.srcIP
+							mainInChan <- n
+							break
+						}
+					}
+				}
 			}
 		case <-tickChan:
+			sessions = updateSessions(sessions)
 			err := refreshRoutes(rules, outChan, errChan, upstreams)
 			if err != nil {
 				fmt.Printf("%s\n", err)
@@ -82,6 +128,26 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 			}
 		}
 	}
+}
+
+func updateSessions(sessions []session) []session {
+	for i, s := range sessions {
+
+		switch s.status {
+		case waiting:
+			sessions[i].status = invalid
+			sessions[i].ttl = ttl
+		default:
+			// remove session
+			if i == len(sessions)-1 {
+				sessions = sessions[:i]
+			} else {
+				sessions = append(sessions[:i], sessions[i+1:]...)
+			}
+		}
+
+	}
+	return sessions
 }
 
 func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstreams map[string]*listener) error {
@@ -111,7 +177,12 @@ func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstrea
 				if link.Attrs().Index == route.LinkIndex && route.Gw == nil {
 					if _, ok := upstreams[link.Attrs().Name]; !ok {
 						log.Printf("New upstream for link %s, rule %s, route %v\n", link.Attrs().Name, rule, route)
-						upstreams[link.Attrs().Name] = &listener{inChan: make(chan ndp), ruleNet: ruleNet}
+						upstreams[link.Attrs().Name] = &listener{
+							inChan:  make(chan ndp),
+							outChan: outChan,
+							errChan: errChan,
+							ruleNet: ruleNet,
+						}
 					}
 				}
 			}
@@ -120,8 +191,7 @@ func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstrea
 	for name, listener := range upstreams {
 		listener.RLock()
 		if !listener.started {
-			listener.outChan = outChan
-			listener.errChan = errChan
+			// launch handler for an upstream of the main proxy interface
 			go handler(name, listener)
 		}
 		if listener.finished {
@@ -132,8 +202,6 @@ func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstrea
 	return nil
 }
 
-// inChan carries messages to be sent from this interface
-// outChan carries messages read from interface
 func handler(ifname string, listener *listener) {
 	var err error
 	var handle *pcap.Handle
@@ -225,6 +293,7 @@ func handler(ifname string, listener *listener) {
 
 		case n, ok := <-listener.inChan:
 			if !ok {
+				// channel was closed
 				return
 			}
 			eth := n.eth
