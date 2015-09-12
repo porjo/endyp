@@ -27,9 +27,10 @@ type sessionStatus int
 
 // sessions track clients who've previously sent neighbor solicits
 type session struct {
+	upstream             *listener
 	srcIP, dstIP, target net.IP
 	status               sessionStatus
-	ttl                  time.Duration
+	expiry               time.Time
 }
 
 type ndp struct {
@@ -76,49 +77,7 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 			fmt.Printf("%s\n", err)
 			return
 		case n := <-outChan:
-			var target net.IP
-			// IPv6 bounds check
-			if len(n.payload) >= 16 {
-				target = net.IP(n.payload[:16])
-			} else {
-				continue
-			}
-
-			// if msg arrived from the main interface, then send to matching upstreams
-			if n.ifname == ifname {
-				for _, upstream := range upstreams {
-					if upstream.ruleNet.Contains(target) {
-						if n.icmp.TypeCode.Type() == layers.ICMPv6TypeNeighborSolicitation {
-							match := false
-							for _, s := range sessions {
-								if s.target.Equal(target) {
-
-									switch s.status {
-									case waiting:
-									case invalid:
-										break
-									case valid:
-										match = true
-									}
-								}
-							}
-						}
-						upstream.inChan <- n
-						continue
-					}
-				}
-			} else { // otherwise send to main interface
-				if n.icmp.TypeCode.Type() == layers.ICMPv6TypeNeighborAdvertisement {
-					for _, s := range sessions {
-						if s.target.Equal(target) {
-							match = true
-							n.ip6.DstIP = s.srcIP
-							mainInChan <- n
-							break
-						}
-					}
-				}
-			}
+			sessions = proxyPacket(ifname, n, mainInChan, outChan, upstreams, sessions)
 		case <-tickChan:
 			sessions = updateSessions(sessions)
 			err := refreshRoutes(rules, outChan, errChan, upstreams)
@@ -130,14 +89,90 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	}
 }
 
+func proxyPacket(ifname string, n ndp, mainInChan, outChan chan ndp, upstreams map[string]*listener, sessions []session) []session {
+
+	var target net.IP
+	// IPv6 bounds check
+	if len(n.payload) >= 16 {
+		target = net.IP(n.payload[:16])
+	} else {
+		return sessions
+	}
+
+	switch n.icmp.TypeCode.Type() {
+	case layers.ICMPv6TypeNeighborAdvertisement:
+		for i, s := range sessions {
+			//if s.target.Equal(target) && s.status == waiting {
+			if s.target.Equal(target) {
+				sessions[i].status = valid
+				n.ip6.DstIP = s.srcIP
+				log.Printf("proxy advert, send")
+				mainInChan <- n
+				return sessions
+			}
+		}
+		log.Printf("proxy advert, no sess")
+	case layers.ICMPv6TypeNeighborSolicitation:
+		if !n.ip6.DstIP.IsMulticast() {
+			return sessions
+		}
+		for _, s := range sessions {
+			if s.target.Equal(target) {
+				log.Printf("proxy solicit, found sess")
+
+				switch s.status {
+				case waiting:
+				case invalid:
+					break
+				case valid:
+					log.Printf("proxy solicit, found sess, send")
+					s.upstream.inChan <- n
+				}
+				return sessions
+			}
+		}
+
+		log.Printf("proxy solicit, no sess")
+		var s *session
+		// if msg arrived from the main interface, then send to matching upstreams
+		for _, upstream := range upstreams {
+			if upstream.ruleNet.Contains(target) {
+				log.Printf("proxy solicit, no sess, new")
+				s = &session{
+					upstream: upstream,
+					srcIP:    n.ip6.SrcIP,
+					dstIP:    n.ip6.DstIP,
+					target:   target,
+					status:   waiting,
+					expiry:   time.Now().Add(ttl),
+				}
+			}
+		}
+
+		if s != nil {
+			sessions = append(sessions, *s)
+			log.Printf("proxy solicit, no sess, send")
+			s.upstream.inChan <- n
+		}
+	}
+
+	return sessions
+}
+
 func updateSessions(sessions []session) []session {
+	log.Printf("update sessions")
 	for i, s := range sessions {
+
+		if s.expiry.After(time.Now()) {
+			continue
+		}
 
 		switch s.status {
 		case waiting:
 			sessions[i].status = invalid
-			sessions[i].ttl = ttl
+			sessions[i].expiry = time.Now().Add(ttl)
 		default:
+			log.Printf("remove sess %d, target %s", i, s.target)
 			// remove session
 			if i == len(sessions)-1 {
 				sessions = sessions[:i]
@@ -280,12 +315,10 @@ func handler(ifname string, listener *listener) {
 					case layers.ICMPv6TypeNeighborSolicitation:
 						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname, payload: payload}
 						log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
-						log.Printf("in payload %x", payload.Payload())
 						listener.outChan <- n
 					case layers.ICMPv6TypeNeighborAdvertisement:
 						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname, payload: payload}
 						log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
-						log.Printf("in payload %x", payload.Payload())
 						listener.outChan <- n
 					}
 				}
@@ -297,6 +330,15 @@ func handler(ifname string, listener *listener) {
 				return
 			}
 			eth := n.eth
+			neighs, err := netlink.NeighList(iface.Index, netlink.FAMILY_V6)
+			if err != nil {
+				return
+			}
+			for _, neigh := range neighs {
+				if neigh.IP.Equal(n.ip6.DstIP) {
+					eth.DstMAC = neigh.HardwareAddr
+				}
+			}
 			eth.SrcMAC = iface.HardwareAddr
 			ipv6 := n.ip6
 			ipv6.SrcIP = linklocal
@@ -313,6 +355,7 @@ func handler(ifname string, listener *listener) {
 				// ND advert opt type, opt length
 				n.payload = append(n.payload[:16], 0x02, 0x01)
 				n.payload = append(n.payload[:18], iface.HardwareAddr...)
+				n.icmp.TypeBytes[0] = 0xc0 // router,solicit,override flags
 			}
 			err = gopacket.SerializeLayers(buf, opts, &eth, &ipv6, &n.icmp, &n.payload)
 			if err != nil {
@@ -326,7 +369,6 @@ func handler(ifname string, listener *listener) {
 				return
 			}
 			log.Printf("%s: write ndp %s, ip6 src %s, dst %s, target %s\n", ifname, n.icmp.TypeCode, ipv6.SrcIP, ipv6.DstIP, net.IP(n.payload[:16]))
-			log.Printf("out payload %x", n.payload.Payload())
 		}
 	}
 }
