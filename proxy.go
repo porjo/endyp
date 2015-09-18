@@ -169,18 +169,18 @@ func proxyPacket(ifname string, n ndp, mainInChan, outChan chan ndp, upstreams m
 
 func updateSessions(sessions []session) []session {
 	log.Printf("update sessions")
-	for i, s := range sessions {
+	for i := 0; i < len(sessions); i++ {
 
-		if s.expiry.After(time.Now()) {
+		if sessions[i].expiry.After(time.Now()) {
 			continue
 		}
 
-		switch s.status {
+		switch sessions[i].status {
 		case waiting:
 			sessions[i].status = invalid
 			sessions[i].expiry = time.Now().Add(ttl)
 		default:
-			log.Printf("remove sess %d, target %s", i, s.target)
+			log.Printf("remove sess %d, target %s", i, sessions[i].target)
 			// remove session
 			if i == len(sessions)-1 {
 				sessions = sessions[:i]
@@ -301,10 +301,11 @@ func handler(ifname string, listener *listener) {
 
 	var eth layers.Ethernet
 	var ip6 layers.IPv6
+	var ip6extensions layers.IPv6ExtensionSkipper
 	var icmp layers.ICMPv6
 	var payload gopacket.Payload
 	decoded := []gopacket.LayerType{}
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &icmp, &payload)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &ip6extensions, &icmp, &payload)
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	packetsChan := packetSource.Packets()
 	for {
@@ -342,15 +343,22 @@ func handler(ifname string, listener *listener) {
 				return
 			}
 			eth := n.eth
-			var neighbors []netlink.Neigh
-			neighbors, err = netlink.NeighList(iface.Index, netlink.FAMILY_V6)
-			if err != nil {
-				return
-			}
+
 			eth.DstMAC = nil
-			for _, neighbor := range neighbors {
-				if neighbor.IP.Equal(n.ip6.DstIP) {
-					eth.DstMAC = neighbor.HardwareAddr
+			if n.ip6.DstIP.IsLinkLocalMulticast() {
+				// Ethernet MAC is derived by the four low-order octets of IPv6 address
+				eth.DstMAC = net.HardwareAddr{0x33, 0x33}
+				eth.DstMAC = append(eth.DstMAC, n.ip6.DstIP[12:]...)
+			} else {
+				var neighbors []netlink.Neigh
+				neighbors, err = netlink.NeighList(iface.Index, netlink.FAMILY_V6)
+				if err != nil {
+					return
+				}
+				for _, neighbor := range neighbors {
+					if neighbor.IP.Equal(n.ip6.DstIP) {
+						eth.DstMAC = neighbor.HardwareAddr
+					}
 				}
 			}
 			if eth.DstMAC == nil {
