@@ -8,6 +8,10 @@ Written as a learning exercise. It works, but shouldn't be relied on.
 
 Pull requests welcome!
 
+## Requirements
+
+- [libpcap](http://www.tcpdump.org/)
+
 ## Usage
 
 `$ ./endyp -c config.toml`

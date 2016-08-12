@@ -33,7 +33,7 @@ const routeCheckInterval = 30
 
 type listener struct {
 	sync.RWMutex
-	inChan, outChan   chan ndp
+	extChan, intChan  chan ndp
 	errChan           chan error
 	ruleNet           *net.IPNet
 	started, finished bool
@@ -72,16 +72,17 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	upstreams := make(map[string]*listener)
 	// shared channels upstreams send to
 	errChan := make(chan error)
-	outChan := make(chan ndp)
+	intChan := make(chan ndp)
 	mainInChan := make(chan ndp)
 	tickChan := time.NewTicker(time.Second * routeCheckInterval).C
 
 	var sessions []session
 
 	// launch handler for main interface 'ifname'
-	go handler(ifname, &listener{outChan: outChan, inChan: mainInChan, errChan: errChan})
+	l := &listener{intChan: intChan, extChan: mainInChan, errChan: errChan}
+	go l.Handler(ifname)
 
-	err = refreshRoutes(rules, outChan, errChan, upstreams)
+	err = refreshRoutes(rules, intChan, errChan, upstreams)
 	if err != nil {
 		fmt.Printf("%s\n", err)
 		return
@@ -92,11 +93,11 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 		case err = <-errChan:
 			fmt.Printf("%s\n", err)
 			return
-		case n := <-outChan:
-			sessions = proxyPacket(ifname, n, mainInChan, outChan, upstreams, sessions)
+		case n := <-intChan:
+			sessions = proxyPacket(ifname, n, mainInChan, upstreams, sessions)
 		case <-tickChan:
 			sessions = updateSessions(sessions)
-			err := refreshRoutes(rules, outChan, errChan, upstreams)
+			err := refreshRoutes(rules, intChan, errChan, upstreams)
 			if err != nil {
 				fmt.Printf("%s\n", err)
 				return
@@ -105,7 +106,7 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	}
 }
 
-func proxyPacket(ifname string, n ndp, mainInChan, outChan chan ndp, upstreams map[string]*listener, sessions []session) []session {
+func proxyPacket(ifname string, n ndp, mainInChan chan ndp, upstreams map[string]*listener, sessions []session) []session {
 	var target net.IP
 	// IPv6 bounds check
 	if len(n.payload) >= 16 {
@@ -117,7 +118,6 @@ func proxyPacket(ifname string, n ndp, mainInChan, outChan chan ndp, upstreams m
 	switch n.icmp.TypeCode.Type() {
 	case layers.ICMPv6TypeNeighborAdvertisement:
 		for i, s := range sessions {
-			//if s.target.Equal(target) && s.status == waiting {
 			if s.target.Equal(target) {
 				sessions[i].status = valid
 				n.ip6.DstIP = s.srcIP
@@ -137,7 +137,7 @@ func proxyPacket(ifname string, n ndp, mainInChan, outChan chan ndp, upstreams m
 				case invalid:
 					break
 				case valid:
-					s.upstream.inChan <- n
+					s.upstream.extChan <- n
 				}
 				return sessions
 			}
@@ -160,7 +160,7 @@ func proxyPacket(ifname string, n ndp, mainInChan, outChan chan ndp, upstreams m
 
 		if s != nil {
 			sessions = append(sessions, *s)
-			s.upstream.inChan <- n
+			s.upstream.extChan <- n
 		}
 	}
 
@@ -193,7 +193,7 @@ func updateSessions(sessions []session) []session {
 	return sessions
 }
 
-func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstreams map[string]*listener) error {
+func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstreams map[string]*listener) error {
 	log.Printf("Refreshing routes...")
 	for _, rule := range rules {
 		_, ruleNet, err := net.ParseCIDR(rule)
@@ -205,7 +205,7 @@ func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstrea
 			// cancel any proxies for removed routes
 			for _, upstream := range upstreams {
 				if upstream.ruleNet.IP.Equal(ruleNet.IP) {
-					close(upstream.inChan)
+					close(upstream.extChan)
 				}
 			}
 			// route not found, skip
@@ -219,10 +219,10 @@ func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstrea
 			for _, route := range routes {
 				if link.Attrs().Index == route.LinkIndex && route.Gw == nil {
 					if _, ok := upstreams[link.Attrs().Name]; !ok {
-						log.Printf("New upstream for link %s, rule %s, route %v\n", link.Attrs().Name, rule, route)
+						log.Printf("New upstream for link '%s', rule '%s', route '%s'\n", link.Attrs().Name, rule, route.Dst)
 						upstreams[link.Attrs().Name] = &listener{
-							inChan:  make(chan ndp),
-							outChan: outChan,
+							extChan: make(chan ndp),
+							intChan: intChan,
 							errChan: errChan,
 							ruleNet: ruleNet,
 						}
@@ -235,7 +235,7 @@ func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstrea
 		listener.RLock()
 		if !listener.started {
 			// launch handler for an upstream of the main proxy interface
-			go handler(name, listener)
+			go listener.Handler(name)
 		}
 		if listener.finished {
 			delete(upstreams, name)
@@ -245,20 +245,20 @@ func refreshRoutes(rules []string, outChan chan ndp, errChan chan error, upstrea
 	return nil
 }
 
-func handler(ifname string, listener *listener) {
+func (l *listener) Handler(ifname string) {
 	var err error
 	var handle *pcap.Handle
 	log.Printf("Spawning listener for if %s\n", ifname)
-	listener.Lock()
-	listener.started = true
-	listener.Unlock()
+	l.Lock()
+	l.started = true
+	l.Unlock()
 
 	defer func() {
-		listener.Lock()
-		listener.finished = true
-		listener.Unlock()
+		l.Lock()
+		l.finished = true
+		l.Unlock()
 		if err != nil {
-			listener.errChan <- err
+			l.errChan <- err
 		}
 	}()
 
@@ -326,18 +326,15 @@ func handler(ifname string, listener *listener) {
 
 					switch icmp.TypeCode.Type() {
 					case layers.ICMPv6TypeNeighborSolicitation:
-						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname, payload: payload}
-						log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
-						listener.outChan <- n
 					case layers.ICMPv6TypeNeighborAdvertisement:
 						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname, payload: payload}
 						log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
-						listener.outChan <- n
+						l.intChan <- n
 					}
 				}
 			}
 
-		case n, ok := <-listener.inChan:
+		case n, ok := <-l.extChan:
 			if !ok {
 				// channel was closed
 				return
