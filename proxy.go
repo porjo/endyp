@@ -200,8 +200,20 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 		if err != nil {
 			return fmt.Errorf("invalid rule '%s', %s", rule, err)
 		}
-		routes, err := netlink.RouteGet(ruleNet.IP)
-		if err != nil || len(routes) == 0 {
+
+		routes, err := netlink.RouteList(nil, netlink.FAMILY_V6)
+		if err != nil {
+			return fmt.Errorf("error enumerating routes, %s", err)
+		}
+		var route *netlink.Route
+		for _, r := range routes {
+			if r.Dst.Contains(ruleNet.IP) {
+				route = &r
+				break
+			}
+		}
+
+		if route == nil {
 			// cancel any proxies for removed routes
 			for _, upstream := range upstreams {
 				if upstream.ruleNet.IP.Equal(ruleNet.IP) {
@@ -216,16 +228,14 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 			return fmt.Errorf("error enumerating links, %s", err)
 		}
 		for _, link := range links {
-			for _, route := range routes {
-				if link.Attrs().Index == route.LinkIndex && route.Gw == nil {
-					if _, ok := upstreams[link.Attrs().Name]; !ok {
-						log.Printf("New upstream for link '%s', rule '%s', route '%s'\n", link.Attrs().Name, rule, route.Dst)
-						upstreams[link.Attrs().Name] = &listener{
-							extChan: make(chan ndp),
-							intChan: intChan,
-							errChan: errChan,
-							ruleNet: ruleNet,
-						}
+			if link.Attrs().Index == route.LinkIndex {
+				if _, ok := upstreams[link.Attrs().Name]; !ok {
+					log.Printf("New upstream for link '%s', rule '%s', route '%s'\n", link.Attrs().Name, rule, route.Dst)
+					upstreams[link.Attrs().Name] = &listener{
+						extChan: make(chan ndp),
+						intChan: intChan,
+						errChan: errChan,
+						ruleNet: ruleNet,
 					}
 				}
 			}
