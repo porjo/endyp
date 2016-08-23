@@ -33,6 +33,7 @@ const routeCheckInterval = 30
 
 type listener struct {
 	sync.RWMutex
+	ifname            string
 	extChan, intChan  chan ndp
 	errChan           chan error
 	ruleNet           *net.IPNet
@@ -50,7 +51,6 @@ type session struct {
 }
 
 type ndp struct {
-	ifname  string
 	payload gopacket.Payload
 	icmp    layers.ICMPv6
 	ip6     layers.IPv6
@@ -73,14 +73,14 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	// shared channels upstreams send to
 	errChan := make(chan error)
 	intChan := make(chan ndp)
-	mainInChan := make(chan ndp)
+	mainExtChan := make(chan ndp)
 	tickChan := time.NewTicker(time.Second * routeCheckInterval).C
 
 	var sessions []session
 
 	// launch handler for main interface 'ifname'
-	l := &listener{intChan: intChan, extChan: mainInChan, errChan: errChan}
-	go l.Handler(ifname)
+	l := &listener{ifname: ifname, intChan: intChan, extChan: mainExtChan, errChan: errChan}
+	go l.Handler()
 
 	err = refreshRoutes(rules, intChan, errChan, upstreams)
 	if err != nil {
@@ -94,7 +94,7 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 			fmt.Printf("%s\n", err)
 			return
 		case n := <-intChan:
-			sessions = proxyPacket(ifname, n, mainInChan, upstreams, sessions)
+			sessions = proxyPacket(n, mainExtChan, upstreams, sessions)
 		case <-tickChan:
 			sessions = updateSessions(sessions)
 			err := refreshRoutes(rules, intChan, errChan, upstreams)
@@ -106,7 +106,7 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	}
 }
 
-func proxyPacket(ifname string, n ndp, mainInChan chan ndp, upstreams map[string]*listener, sessions []session) []session {
+func proxyPacket(n ndp, mainExtChan chan ndp, upstreams map[string]*listener, sessions []session) []session {
 	var target net.IP
 	// IPv6 bounds check
 	if len(n.payload) >= 16 {
@@ -121,7 +121,7 @@ func proxyPacket(ifname string, n ndp, mainInChan chan ndp, upstreams map[string
 			if s.target.Equal(target) {
 				sessions[i].status = valid
 				n.ip6.DstIP = s.srcIP
-				mainInChan <- n
+				mainExtChan <- n
 				return sessions
 			}
 		}
@@ -158,6 +158,10 @@ func proxyPacket(ifname string, n ndp, mainInChan chan ndp, upstreams map[string
 		}
 
 		if s != nil {
+			if !s.upstream.started {
+				// launch upstream handler
+				go s.upstream.Handler()
+			}
 			sessions = append(sessions, *s)
 			s.upstream.extChan <- n
 		}
@@ -231,6 +235,7 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 				if _, ok := upstreams[link.Attrs().Name]; !ok {
 					log.Printf("New upstream for link '%s', rule '%s', route '%s'\n", link.Attrs().Name, rule, route.Dst)
 					upstreams[link.Attrs().Name] = &listener{
+						ifname:  link.Attrs().Name,
 						extChan: make(chan ndp),
 						intChan: intChan,
 						errChan: errChan,
@@ -242,10 +247,6 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 	}
 	for name, listener := range upstreams {
 		listener.RLock()
-		if !listener.started {
-			// launch handler for an upstream of the main proxy interface
-			go listener.Handler(name)
-		}
 		if listener.finished {
 			delete(upstreams, name)
 		}
@@ -254,10 +255,10 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 	return nil
 }
 
-func (l *listener) Handler(ifname string) {
+func (l *listener) Handler() {
 	var err error
 	var handle *pcap.Handle
-	log.Printf("Spawning listener for if %s\n", ifname)
+	log.Printf("Spawning listener for if %s\n", l.ifname)
 	l.Lock()
 	l.started = true
 	l.Unlock()
@@ -271,18 +272,18 @@ func (l *listener) Handler(ifname string) {
 		}
 	}()
 
-	handle, err = pcap.OpenLive(ifname, snaplen, true, 0)
+	handle, err = pcap.OpenLive(l.ifname, snaplen, true, 0)
 	if err != nil {
 		err = fmt.Errorf("pcap open error: %s", err)
 		return
 	}
 	defer handle.Close()
 	defer func() {
-		log.Printf("%s: handler exit %s", ifname, err)
+		log.Printf("%s: handler exit %s", l.ifname, err)
 	}()
 
 	var iface *net.Interface
-	iface, err = net.InterfaceByName(ifname)
+	iface, err = net.InterfaceByName(l.ifname)
 	if err != nil {
 		return
 	}
@@ -304,7 +305,7 @@ func (l *listener) Handler(ifname string) {
 	}
 
 	if linklocal.IsUnspecified() {
-		err = fmt.Errorf("error finding link local unicast address for interface %s", ifname)
+		err = fmt.Errorf("error finding link local unicast address for interface %s", l.ifname)
 		return
 	}
 
@@ -335,9 +336,9 @@ func (l *listener) Handler(ifname string) {
 
 					switch icmp.TypeCode.Type() {
 					case layers.ICMPv6TypeNeighborSolicitation, layers.ICMPv6TypeNeighborAdvertisement:
-						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname, payload: payload}
+						n := ndp{eth: eth, ip6: ip6, icmp: icmp, payload: payload}
 						if verbose {
-							log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
+							log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", l.ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
 						}
 						l.intChan <- n
 					}
@@ -401,7 +402,7 @@ func (l *listener) Handler(ifname string) {
 				return
 			}
 			if verbose {
-				log.Printf("%s: write ndp %s, ip6 src %s, dst %s, target %s\n", ifname, n.icmp.TypeCode, ipv6.SrcIP, ipv6.DstIP, net.IP(n.payload[:16]))
+				log.Printf("%s: write ndp %s, ip6 src %s, dst %s, target %s\n", l.ifname, n.icmp.TypeCode, ipv6.SrcIP, ipv6.DstIP, net.IP(n.payload[:16]))
 			}
 		}
 	}
