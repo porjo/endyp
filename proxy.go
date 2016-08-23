@@ -133,8 +133,7 @@ func proxyPacket(ifname string, n ndp, mainInChan chan ndp, upstreams map[string
 			if s.target.Equal(target) {
 
 				switch s.status {
-				case waiting:
-				case invalid:
+				case waiting, invalid:
 					break
 				case valid:
 					s.upstream.extChan <- n
@@ -335,10 +334,11 @@ func (l *listener) Handler(ifname string) {
 					}
 
 					switch icmp.TypeCode.Type() {
-					case layers.ICMPv6TypeNeighborSolicitation:
-					case layers.ICMPv6TypeNeighborAdvertisement:
+					case layers.ICMPv6TypeNeighborSolicitation, layers.ICMPv6TypeNeighborAdvertisement:
 						n := ndp{eth: eth, ip6: ip6, icmp: icmp, ifname: ifname, payload: payload}
-						log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
+						if verbose {
+							log.Printf("%s: read ndp %s, ip6 src %s, dst %s, target %s\n", ifname, icmp.TypeCode, ip6.SrcIP, ip6.DstIP, target)
+						}
 						l.intChan <- n
 					}
 				}
@@ -400,7 +400,9 @@ func (l *listener) Handler(ifname string) {
 				err = fmt.Errorf("pcap write error: %s", err)
 				return
 			}
-			log.Printf("%s: write ndp %s, ip6 src %s, dst %s, target %s\n", ifname, n.icmp.TypeCode, ipv6.SrcIP, ipv6.DstIP, net.IP(n.payload[:16]))
+			if verbose {
+				log.Printf("%s: write ndp %s, ip6 src %s, dst %s, target %s\n", ifname, n.icmp.TypeCode, ipv6.SrcIP, ipv6.DstIP, net.IP(n.payload[:16]))
+			}
 		}
 	}
 }

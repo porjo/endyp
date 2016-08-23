@@ -29,8 +29,10 @@ import (
 const snaplen = 100
 
 var confFile = flag.String("c", "config.toml", "config file")
+var verbose bool
 
 func main() {
+	flag.BoolVar(&verbose, "v", false, "verbose output")
 	flag.Parse()
 
 	conf, err := ReadConfig(*confFile)
