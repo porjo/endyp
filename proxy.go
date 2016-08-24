@@ -80,7 +80,7 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 
 	// launch handler for main interface 'ifname'
 	l := &listener{ifname: ifname, intChan: intChan, extChan: mainExtChan, errChan: errChan}
-	go l.Handler()
+	go l.handler()
 
 	err = refreshRoutes(rules, intChan, errChan, upstreams)
 	if err != nil {
@@ -106,7 +106,7 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	}
 }
 
-func proxyPacket(n ndp, mainExtChan chan ndp, upstreams map[string]*listener, sessions []session) []session {
+func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessions []session) []session {
 	var target net.IP
 	// IPv6 bounds check
 	if len(n.payload) >= 16 {
@@ -121,7 +121,7 @@ func proxyPacket(n ndp, mainExtChan chan ndp, upstreams map[string]*listener, se
 			if s.target.Equal(target) {
 				sessions[i].status = valid
 				n.ip6.DstIP = s.srcIP
-				mainExtChan <- n
+				extChan <- n
 				return sessions
 			}
 		}
@@ -160,7 +160,7 @@ func proxyPacket(n ndp, mainExtChan chan ndp, upstreams map[string]*listener, se
 		if s != nil {
 			if !s.upstream.started {
 				// launch upstream handler
-				go s.upstream.Handler()
+				go s.upstream.handler()
 			}
 			sessions = append(sessions, *s)
 			s.upstream.extChan <- n
@@ -171,33 +171,33 @@ func proxyPacket(n ndp, mainExtChan chan ndp, upstreams map[string]*listener, se
 }
 
 func updateSessions(sessions []session) []session {
-	log.Printf("update sessions")
-	for i := 0; i < len(sessions); i++ {
+	if verbose {
+		log.Printf("updating sessions...")
+	}
+	for i, s := range sessions {
 
-		if sessions[i].expiry.After(time.Now()) {
+		if s.expiry.After(time.Now()) {
 			continue
 		}
 
-		switch sessions[i].status {
+		switch s.status {
 		case waiting:
 			sessions[i].status = invalid
 			sessions[i].expiry = time.Now().Add(ttl)
 		default:
-			log.Printf("remove sess %d, target %s", i, sessions[i].target)
-			// remove session
-			if i == len(sessions)-1 {
-				sessions = sessions[:i]
-			} else {
-				sessions = append(sessions[:i], sessions[i+1:]...)
+			if verbose {
+				log.Printf("remove session %d, target %s", i, s.target)
 			}
+			sessions = append(sessions[:i], sessions[i+1:]...)
 		}
-
 	}
 	return sessions
 }
 
 func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstreams map[string]*listener) error {
-	log.Printf("Refreshing routes...")
+	if verbose {
+		log.Printf("refreshing routes...")
+	}
 	for _, rule := range rules {
 		_, ruleNet, err := net.ParseCIDR(rule)
 		if err != nil {
@@ -210,7 +210,7 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 		}
 		var route *netlink.Route
 		for _, r := range routes {
-			if r.Dst.Contains(ruleNet.IP) {
+			if r.Dst != nil && r.Dst.Contains(ruleNet.IP) {
 				route = &r
 				break
 			}
@@ -220,7 +220,9 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 			// cancel any proxies for removed routes
 			for _, upstream := range upstreams {
 				if upstream.ruleNet.IP.Equal(ruleNet.IP) {
+					log.Printf("route for upstream if %s went away. Removing listener...\n", upstream.ifname)
 					close(upstream.extChan)
+					delete(upstreams, upstream.ifname)
 				}
 			}
 			// route not found, skip
@@ -233,7 +235,7 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 		for _, link := range links {
 			if link.Attrs().Index == route.LinkIndex {
 				if _, ok := upstreams[link.Attrs().Name]; !ok {
-					log.Printf("New upstream for link '%s', rule '%s', route '%s'\n", link.Attrs().Name, rule, route.Dst)
+					log.Printf("new upstream for link '%s', rule '%s', route '%s'\n", link.Attrs().Name, rule, route.Dst)
 					upstreams[link.Attrs().Name] = &listener{
 						ifname:  link.Attrs().Name,
 						extChan: make(chan ndp),
@@ -255,10 +257,10 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 	return nil
 }
 
-func (l *listener) Handler() {
+func (l *listener) handler() {
 	var err error
 	var handle *pcap.Handle
-	log.Printf("Spawning listener for if %s\n", l.ifname)
+	log.Printf("spawning listener for if %s\n", l.ifname)
 	l.Lock()
 	l.started = true
 	l.Unlock()
@@ -278,9 +280,6 @@ func (l *listener) Handler() {
 		return
 	}
 	defer handle.Close()
-	defer func() {
-		log.Printf("%s: handler exit %s", l.ifname, err)
-	}()
 
 	var iface *net.Interface
 	iface, err = net.InterfaceByName(l.ifname)
