@@ -14,6 +14,8 @@ Pull requests welcome!
 
 ## Usage
 
+Download a precompiled binary for Linux form the [releases](https://github.com/porjo/endyp/releases) page, or compile yourself.
+
 `$ ./endyp -c config.toml`
 
 The config file is similar to ndppd e.g.
