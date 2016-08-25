@@ -19,21 +19,40 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 
 	"github.com/vishvananda/netlink"
 )
 
-// snaplen should be large enough to capture the layers we're interested in
-const snaplen = 100
-
 var confFile = flag.String("c", "config.toml", "config file")
-var verbose bool
+
+type vlogger struct {
+	logger  *log.Logger
+	enabled bool
+}
+
+func (l *vlogger) Printf(format string, v ...interface{}) {
+	if l.enabled {
+		l.logger.Printf(format, v...)
+	}
+}
+func (l *vlogger) Println(v ...interface{}) {
+	if l.enabled {
+		l.logger.Println(v...)
+	}
+}
+
+var vlog vlogger
 
 func main() {
-	flag.BoolVar(&verbose, "v", false, "verbose output")
+	flag.BoolVar(&vlog.enabled, "v", false, "verbose output to stderr")
 	flag.Parse()
+
+	if vlog.enabled {
+		vlog.logger = log.New(os.Stderr, "", 0)
+	}
 
 	conf, err := ReadConfig(*confFile)
 	if err != nil {
