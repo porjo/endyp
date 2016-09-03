@@ -29,12 +29,6 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-//const routeCheckInterval = 30
-const routeCheckInterval = 120
-
-// snaplen should be large enough to capture the layers we're interested in
-const snaplen = 100
-
 type listener struct {
 	sync.RWMutex
 	ifname            string
@@ -66,7 +60,13 @@ const (
 	valid
 	invalid
 
-	ttl = time.Duration(500 * time.Millisecond)
+	timeout = time.Duration(500 * time.Millisecond)
+	ttl     = time.Duration(30 * time.Second)
+
+	routeCheckInterval = 30
+
+	// snaplen should be large enough to capture the layers we're interested in
+	snaplen = 100
 )
 
 func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
@@ -78,7 +78,8 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	errChan := make(chan error)
 	intChan := make(chan ndp)
 	mainExtChan := make(chan ndp)
-	tickChan := time.NewTicker(time.Second * routeCheckInterval).C
+	tickRouteChan := time.NewTicker(time.Second * routeCheckInterval).C
+	tickSessChan := time.NewTicker(time.Millisecond * 100).C
 
 	defer func() {
 		for _, upstream := range upstreams {
@@ -106,8 +107,9 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 			return
 		case n := <-intChan:
 			sessions = proxyPacket(n, mainExtChan, upstreams, sessions)
-		case <-tickChan:
+		case <-tickSessChan:
 			sessions = updateSessions(sessions)
+		case <-tickRouteChan:
 			err := refreshRoutes(rules, intChan, errChan, upstreams)
 			if err != nil {
 				fmt.Printf("%s\n", err)
@@ -132,6 +134,7 @@ func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessio
 			if s.target.Equal(target) && sessions[i].status == waiting {
 				vlog.Printf("advert, using existing session for target %s\n", target)
 				sessions[i].status = valid
+				sessions[i].expiry = time.Now().Add(ttl)
 				n.ip6.DstIP = s.srcIP
 				extChan <- n
 				return sessions
@@ -170,7 +173,7 @@ func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessio
 					dstIP:    n.ip6.DstIP,
 					target:   target,
 					status:   waiting,
-					expiry:   time.Now().Add(ttl),
+					expiry:   time.Now().Add(timeout),
 				}
 			}
 		}
@@ -189,7 +192,6 @@ func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessio
 }
 
 func updateSessions(sessions []session) []session {
-	vlog.Println("updating sessions...")
 	for i := len(sessions) - 1; i >= 0; i-- {
 
 		if sessions[i].expiry.After(time.Now()) {
@@ -198,6 +200,7 @@ func updateSessions(sessions []session) []session {
 
 		switch sessions[i].status {
 		case waiting:
+			vlog.Printf("set waiting session %d to invalid, target %s", i, sessions[i].target)
 			sessions[i].status = invalid
 			sessions[i].expiry = time.Now().Add(ttl)
 		default:
@@ -287,7 +290,8 @@ func (l *listener) handler() {
 		log.Printf("exiting listener for if %s\n", l.ifname)
 	}()
 
-	handle, err = pcap.OpenLive(l.ifname, snaplen, false, pcap.BlockForever)
+	// open interface in promiscuous mode in order to pickup solicited-node multicasts
+	handle, err = pcap.OpenLive(l.ifname, snaplen, true, pcap.BlockForever)
 	if err != nil {
 		err = fmt.Errorf("pcap open error: %s", err)
 		return
