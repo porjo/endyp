@@ -69,6 +69,8 @@ const (
 	snaplen = 100
 )
 
+var IPV6SolicitedNode = net.IP{0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0, 0, 0}
+
 func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 	defer wg.Done()
 
@@ -377,6 +379,7 @@ func (l *listener) handler() {
 				for _, neighbor := range neighbors {
 					if neighbor.IP.Equal(n.ip6.DstIP) {
 						n.eth.DstMAC = neighbor.HardwareAddr
+						break
 					}
 				}
 			}
@@ -385,7 +388,7 @@ func (l *listener) handler() {
 				// Try Solicited-Node multicast address
 				// dst IP is derived by the first 13 octets of multicast address +
 				// last 3 octets of dst IP
-				n.ip6.DstIP = append(net.IPv6linklocalallnodes[:13], n.ip6.DstIP[13:]...)
+				n.ip6.DstIP = append(IPV6SolicitedNode[:13], n.ip6.DstIP[13:]...)
 				n.eth.DstMAC = append(net.HardwareAddr{0x33, 0x33}, n.ip6.DstIP[12:]...)
 			}
 			n.eth.SrcMAC = iface.HardwareAddr
