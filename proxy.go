@@ -315,17 +315,19 @@ func (l *listener) handler() {
 		return
 	}
 
-	var c net.PacketConn
+	var c *icmp.PacketConn
 	vlog.Printf("%s\t about to listen on IP %s\n", l.ifname, ifaceIP)
 	//c, err = net.ListenPacket("ip6:ipv6-icmp", "::") // all local IPs/interfaces
-	c, err = net.ListenPacket("ip6:ipv6-icmp", linklocal.String()+"%"+l.ifname)
+	//c, err = net.ListenPacket("ip6:ipv6-icmp", linklocal.String()+"%"+l.ifname)
+	c, err = icmp.ListenPacket("ip6:ipv6-icmp", linklocal.String()+"%"+l.ifname)
 	if err != nil {
 		return
 	}
 
 	defer c.Close()
 
-	p := ipv6.NewPacketConn(c)
+	//p := ipv6.NewPacketConn(c)
+	p := c.IPv6PacketConn()
 	err = p.SetControlMessage(ipv6.FlagSrc|ipv6.FlagDst, true)
 	if err != nil {
 		return
