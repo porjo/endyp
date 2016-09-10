@@ -317,8 +317,8 @@ func (l *listener) handler() {
 
 	var c net.PacketConn
 	vlog.Printf("%s\t about to listen on IP %s\n", l.ifname, ifaceIP)
-	//c, err = net.ListenPacket("ip6:ipv6-icmp", "::")
-	c, err = net.ListenPacket("ip6:ipv6-icmp", ifaceIP.String())
+	//c, err = net.ListenPacket("ip6:ipv6-icmp", "::") // all local IPs/interfaces
+	c, err = net.ListenPacket("ip6:ipv6-icmp", linklocal.String()+"%"+l.ifname)
 	if err != nil {
 		return
 	}
@@ -352,6 +352,7 @@ func (l *listener) handler() {
 				errChan <- err
 				return
 			}
+			vlog.Printf("%s\tpayload %x\n", l.ifname, payload)
 			var target net.IP
 			// IPv6 bounds check
 			if len(payload) >= 16 {
