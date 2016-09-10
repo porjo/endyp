@@ -23,10 +23,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv6"
 )
 
 type listener struct {
@@ -42,17 +41,18 @@ type sessionStatus int
 
 // sessions track clients who've previously sent neighbor solicits
 type session struct {
-	upstream             *listener
-	srcIP, dstIP, target net.IP
-	status               sessionStatus
-	expiry               time.Time
+	upstream     *listener
+	srcIP, dstIP net.IPAddr
+	target       net.IP
+	status       sessionStatus
+	expiry       time.Time
 }
 
 type ndp struct {
-	payload gopacket.Payload
-	icmp    layers.ICMPv6
-	ip6     layers.IPv6
-	eth     layers.Ethernet
+	target       net.IP
+	icmpType     icmp.Type
+	srcIP, dstIP net.IPAddr
+	payload      []byte
 }
 
 const (
@@ -130,20 +130,20 @@ func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessio
 		return sessions
 	}
 
-	switch n.icmp.TypeCode.Type() {
-	case layers.ICMPv6TypeNeighborAdvertisement:
+	switch n.icmpType {
+	case ipv6.ICMPTypeNeighborAdvertisement:
 		for i, s := range sessions {
 			if s.target.Equal(target) && sessions[i].status == waiting {
 				vlog.Printf("advert, using existing session for target %s\n", target)
 				sessions[i].status = valid
 				sessions[i].expiry = time.Now().Add(ttl)
-				n.ip6.DstIP = s.srcIP
+				n.dstIP = s.srcIP
 				extChan <- n
 				return sessions
 			}
 		}
-	case layers.ICMPv6TypeNeighborSolicitation:
-		if !n.ip6.DstIP.IsMulticast() {
+	case ipv6.ICMPTypeNeighborSolicitation:
+		if !n.dstIP.IP.IsMulticast() {
 			return sessions
 		}
 		for _, s := range sessions {
@@ -155,9 +155,9 @@ func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessio
 				case valid:
 					// swap solicit for advert and send back out main interface
 					vlog.Printf("solicit, using existing session for target %s\n", target)
-					n.icmp.TypeCode = layers.CreateICMPv6TypeCode(layers.ICMPv6TypeNeighborAdvertisement, 0)
-					n.ip6.DstIP = n.ip6.SrcIP
-					n.ip6.SrcIP = nil
+					n.icmpType = ipv6.ICMPTypeNeighborAdvertisement
+					n.dstIP = n.srcIP
+					n.srcIP.IP = nil
 					extChan <- n
 				}
 				return sessions
@@ -171,8 +171,8 @@ func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessio
 				vlog.Printf("session not found when handling solicit for target %s. Creating new session...\n", net.IP(n.payload[:16]))
 				s = &session{
 					upstream: upstream,
-					srcIP:    n.ip6.SrcIP,
-					dstIP:    n.ip6.DstIP,
+					srcIP:    n.srcIP,
+					dstIP:    n.dstIP,
 					target:   target,
 					status:   waiting,
 					expiry:   time.Now().Add(timeout),
@@ -276,7 +276,6 @@ func refreshRoutes(rules []string, intChan chan ndp, errChan chan error, upstrea
 
 func (l *listener) handler() {
 	var err error
-	var handle *pcap.Handle
 	log.Printf("spawning listener for if %s\n", l.ifname)
 	l.Lock()
 	l.started = true
@@ -292,13 +291,19 @@ func (l *listener) handler() {
 		log.Printf("exiting listener for if %s\n", l.ifname)
 	}()
 
-	// open interface in promiscuous mode in order to pickup solicited-node multicasts
-	handle, err = pcap.OpenLive(l.ifname, snaplen, true, pcap.BlockForever)
+	var c net.PacketConn
+	c, err = net.ListenPacket("ip6:58", "::") // ICMP for IPv6
 	if err != nil {
-		err = fmt.Errorf("pcap open error: %s", err)
 		return
 	}
-	defer handle.Close()
+
+	defer c.Close()
+
+	p := ipv6.NewPacketConn(c)
+	err = p.SetControlMessage(ipv6.FlagSrc|ipv6.FlagDst, true)
+	if err != nil {
+		return
+	}
 
 	var iface *net.Interface
 	iface, err = net.InterfaceByName(l.ifname)
@@ -327,98 +332,122 @@ func (l *listener) handler() {
 		return
 	}
 
-	var eth layers.Ethernet
-	var ip6 layers.IPv6
-	var ip6extensions layers.IPv6ExtensionSkipper
-	var icmp layers.ICMPv6
-	var payload gopacket.Payload
-	decoded := []gopacket.LayerType{}
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &ip6extensions, &icmp, &payload)
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	packetsChan := packetSource.Packets()
-	for {
-		select {
-		case packet := <-packetsChan:
-			parser.DecodeLayers(packet.Data(), &decoded)
-			for _, layerType := range decoded {
-				switch layerType {
-				case layers.LayerTypeICMPv6:
-					var target net.IP
-					// IPv6 bounds check
-					if len(payload) >= 16 {
-						target = net.IP(payload[:16])
-					} else {
-						continue
-					}
+	var f ipv6.ICMPFilter
+	f.SetAll(true)
+	f.Accept(ipv6.ICMPTypeNeighborSolicitation)
+	f.Accept(ipv6.ICMPTypeNeighborAdvertisement)
+	err = p.SetICMPFilter(&f)
+	if err != nil {
+		return
+	}
 
-					switch icmp.TypeCode.Type() {
-					case layers.ICMPv6TypeNeighborSolicitation, layers.ICMPv6TypeNeighborAdvertisement:
-						n := ndp{eth: eth, ip6: ip6, icmp: icmp, payload: payload}
-						vlog.Printf("%s\tread\t%s\tmac_src %s\tip6_src %s\tip6_dst %s\ttarget %s\n", l.ifname, icmp.TypeCode, eth.SrcMAC, ip6.SrcIP, ip6.DstIP, target)
-						l.intChan <- n
-					}
-				}
+	errChan := make(chan error)
+
+	go func() {
+		for {
+			payload := make([]byte, snaplen)
+			i, rcm, src, err := p.ReadFrom(payload)
+			if err != nil {
+				// send an error if it's encountered
+				errChan <- err
+				return
+			}
+			var target net.IP
+			// IPv6 bounds check
+			if len(payload) >= 16 {
+				target = net.IP(payload[:16])
+			} else {
+				continue
+			}
+			// 58 protocol number for IPv6-ICMP
+			rm, err := icmp.ParseMessage(58, payload[:i])
+			if err != nil {
+				return
 			}
 
+			var srcIP *net.IPAddr
+			srcIP, err = net.ResolveIPAddr(src.Network(), src.String())
+			if err != nil {
+				return
+			}
+			var dstIP *net.IPAddr
+			dstIP.IP = rcm.Dst
+			n := ndp{target: target, icmpType: rm.Type, dstIP: *dstIP, srcIP: *srcIP, payload: payload}
+			// send data if we read some.
+			l.intChan <- n
+			vlog.Printf("%s\tread\t%s\tip6_src %s\tip6_dst %s\ttarget %s\n", l.ifname, n.icmpType, n.srcIP.IP, n.dstIP.IP, n.target)
+		}
+	}()
+
+	for {
+		select {
+
+		case err = <-errChan:
+			return
 		case n, ok := <-l.extChan:
 			if !ok {
 				// channel was closed
 				return
 			}
 
-			n.eth.DstMAC = nil
-			if n.ip6.DstIP.IsLinkLocalMulticast() {
-				// Ethernet MAC is derived by the four low-order octets of IPv6 address
-				n.eth.DstMAC = append(net.HardwareAddr{0x33, 0x33}, n.ip6.DstIP[12:]...)
-			} else {
-				var neighbors []netlink.Neigh
-				neighbors, err = netlink.NeighList(iface.Index, netlink.FAMILY_V6)
-				if err != nil {
-					return
-				}
-				for _, neighbor := range neighbors {
-					if neighbor.IP.Equal(n.ip6.DstIP) {
-						n.eth.DstMAC = neighbor.HardwareAddr
-						break
-					}
-				}
+			wm := icmp.Message{
+				Type: n.icmpType, Code: 0,
+				Body: &AdvertSolicit{
+					icmpType: n.icmpType,
+					target:   n.target,
+				},
 			}
-			if n.eth.DstMAC == nil {
-				vlog.Printf("%s: could not find destination MAC address. %s mac_src %s ip6_dst %s ip6_src %s target %s", l.ifname, n.icmp.TypeCode, n.eth.SrcMAC, n.ip6.DstIP, n.ip6.SrcIP, net.IP(n.payload[:16]))
-				// Try Solicited-Node multicast address
-				// dst IP is derived by the first 13 octets of multicast address +
-				// last 3 octets of dst IP
-				n.ip6.DstIP = append(IPV6SolicitedNode[:13], n.ip6.DstIP[13:]...)
-				n.eth.DstMAC = append(net.HardwareAddr{0x33, 0x33}, n.ip6.DstIP[12:]...)
-			}
-			n.eth.SrcMAC = iface.HardwareAddr
-			n.ip6.SrcIP = linklocal
-			buf := gopacket.NewSerializeBuffer()
-			n.icmp.SetNetworkLayerForChecksum(&n.ip6)
-			opts := gopacket.SerializeOptions{ComputeChecksums: true}
-			switch n.icmp.TypeCode.Type() {
-			case layers.ICMPv6TypeNeighborSolicitation:
-				// source link-layer address opt type, opt length
-				n.payload = append(n.payload[:16], 0x01, 0x01)
-			case layers.ICMPv6TypeNeighborAdvertisement:
-				// target link-layer address opt type, opt length
-				n.payload = append(n.payload[:16], 0x02, 0x01)
-				n.icmp.TypeBytes[0] = 0xc0 // router,solicit,override flags
-			}
-			n.payload = append(n.payload[:18], iface.HardwareAddr...)
 
-			err = gopacket.SerializeLayers(buf, opts, &n.eth, &n.ip6, &n.icmp, &n.payload)
+			var wb []byte
+			wb, err = wm.Marshal(nil)
 			if err != nil {
-				err = fmt.Errorf("serialize layers error: %s", err)
 				return
 			}
 
-			err = handle.WritePacketData(buf.Bytes())
+			var wcm ipv6.ControlMessage
+			wcm.Src = linklocal
+			wcm.HopLimit = 255 // as per RFC
+			_, err = p.WriteTo(wb, &wcm, &n.dstIP)
 			if err != nil {
-				err = fmt.Errorf("pcap write error: %s", err)
 				return
 			}
-			vlog.Printf("%s\twrite\t%s\tmac_dst %s\tip6_src %s\tip6_dst %s\ttarget %s\n", l.ifname, n.icmp.TypeCode, n.eth.DstMAC, n.ip6.SrcIP, n.ip6.DstIP, net.IP(n.payload[:16]))
+
+			vlog.Printf("%s\twrite\t%s\tip6_src %s\tip6_dst %s\ttarget %s\n", l.ifname, n.icmpType, n.srcIP.IP, n.dstIP.IP, n.target)
 		}
 	}
+}
+
+type AdvertSolicit struct {
+	icmpType icmp.Type
+	target   net.IP
+}
+
+// Len implements the Len method of MessageBody interface.
+func (p *AdvertSolicit) Len(proto int) int {
+	if p == nil {
+		return 0
+	}
+	// first 4 bytes reserved, IP, options
+	return 4 + 16 + 2
+}
+
+// Marshal implements the Marshal method of MessageBody interface.
+func (p *AdvertSolicit) Marshal(proto int) ([]byte, error) {
+
+	// first 4 bytes reserved, IP, options
+	b := make([]byte, 4+16+2)
+	switch p.icmpType {
+	case ipv6.ICMPTypeNeighborSolicitation:
+		// source link-layer address opt type, opt length
+		b = append(b[:4], p.target...)
+		b = append(b[:20], 0x01, 0x01)
+	case ipv6.ICMPTypeNeighborAdvertisement:
+		// router,solicit,override flags
+		b[0] = 0xc0
+		// target link-layer address opt type, opt length
+		b = append(b[:4], p.target...)
+		b = append(b[:20], 0x02, 0x01)
+	}
+
+	return b, nil
 }
