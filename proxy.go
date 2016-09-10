@@ -122,19 +122,12 @@ func Proxy(wg *sync.WaitGroup, ifname string, rules []string) {
 }
 
 func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessions []session) []session {
-	var target net.IP
-	// IPv6 bounds check
-	if len(n.payload) >= 16 {
-		target = net.IP(n.payload[:16])
-	} else {
-		return sessions
-	}
 
 	switch n.icmpType {
 	case ipv6.ICMPTypeNeighborAdvertisement:
 		for i, s := range sessions {
-			if s.target.Equal(target) && sessions[i].status == waiting {
-				vlog.Printf("advert, using existing session for target %s\n", target)
+			if s.target.Equal(n.target) && sessions[i].status == waiting {
+				vlog.Printf("advert, using existing session for target %s\n", n.target)
 				sessions[i].status = valid
 				sessions[i].expiry = time.Now().Add(ttl)
 				n.dstIP = s.srcIP
@@ -147,14 +140,14 @@ func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessio
 			return sessions
 		}
 		for _, s := range sessions {
-			if s.target.Equal(target) {
+			if s.target.Equal(n.target) {
 
 				switch s.status {
 				case waiting, invalid:
 					break
 				case valid:
 					// swap solicit for advert and send back out main interface
-					vlog.Printf("solicit, using existing session for target %s\n", target)
+					vlog.Printf("solicit, using existing session for target %s\n", n.target)
 					n.icmpType = ipv6.ICMPTypeNeighborAdvertisement
 					n.dstIP = n.srcIP
 					n.srcIP.IP = nil
@@ -167,13 +160,13 @@ func proxyPacket(n ndp, extChan chan ndp, upstreams map[string]*listener, sessio
 		var s *session
 		// if msg arrived from the main interface, then send to matching upstreams
 		for _, upstream := range upstreams {
-			if upstream.ruleNet.Contains(target) {
-				vlog.Printf("session not found when handling solicit for target %s. Creating new session...\n", net.IP(n.payload[:16]))
+			if upstream.ruleNet.Contains(n.target) {
+				vlog.Printf("session not found when handling solicit for target %s. Creating new session...\n", n.target)
 				s = &session{
 					upstream: upstream,
 					srcIP:    n.srcIP,
 					dstIP:    n.dstIP,
-					target:   target,
+					target:   n.target,
 					status:   waiting,
 					expiry:   time.Now().Add(timeout),
 				}
@@ -291,20 +284,6 @@ func (l *listener) handler() {
 		log.Printf("exiting listener for if %s\n", l.ifname)
 	}()
 
-	var c net.PacketConn
-	c, err = net.ListenPacket("ip6:58", "::") // ICMP for IPv6
-	if err != nil {
-		return
-	}
-
-	defer c.Close()
-
-	p := ipv6.NewPacketConn(c)
-	err = p.SetControlMessage(ipv6.FlagSrc|ipv6.FlagDst, true)
-	if err != nil {
-		return
-	}
-
 	var iface *net.Interface
 	iface, err = net.InterfaceByName(l.ifname)
 	if err != nil {
@@ -313,6 +292,7 @@ func (l *listener) handler() {
 
 	var addrs []net.Addr
 	var linklocal net.IP
+	var ifaceIP net.IP
 	addrs, err = iface.Addrs()
 	if err != nil {
 		return
@@ -323,12 +303,31 @@ func (l *listener) handler() {
 		case *net.IPNet:
 			if v.IP.IsLinkLocalUnicast() {
 				linklocal = v.IP
+			} else if v.IP.To16() != nil {
+				ifaceIP = v.IP
 			}
+			break
 		}
 	}
 
 	if linklocal.IsUnspecified() {
 		err = fmt.Errorf("error finding link local unicast address for if %s", l.ifname)
+		return
+	}
+
+	var c net.PacketConn
+	vlog.Printf("%s\t about to listen on IP %s\n", l.ifname, ifaceIP)
+	//c, err = net.ListenPacket("ip6:ipv6-icmp", "::")
+	c, err = net.ListenPacket("ip6:ipv6-icmp", ifaceIP.String())
+	if err != nil {
+		return
+	}
+
+	defer c.Close()
+
+	p := ipv6.NewPacketConn(c)
+	err = p.SetControlMessage(ipv6.FlagSrc|ipv6.FlagDst, true)
+	if err != nil {
 		return
 	}
 
@@ -345,6 +344,7 @@ func (l *listener) handler() {
 
 	go func() {
 		for {
+			vlog.Printf("%s\tenter packet read\n", l.ifname)
 			payload := make([]byte, snaplen)
 			i, rcm, src, err := p.ReadFrom(payload)
 			if err != nil {
@@ -355,24 +355,26 @@ func (l *listener) handler() {
 			var target net.IP
 			// IPv6 bounds check
 			if len(payload) >= 16 {
-				target = net.IP(payload[:16])
+				target = net.IP(payload[8:24])
 			} else {
 				continue
 			}
 			// 58 protocol number for IPv6-ICMP
 			rm, err := icmp.ParseMessage(58, payload[:i])
 			if err != nil {
+				errChan <- err
 				return
 			}
 
 			var srcIP *net.IPAddr
 			srcIP, err = net.ResolveIPAddr(src.Network(), src.String())
 			if err != nil {
+				errChan <- err
 				return
 			}
-			var dstIP *net.IPAddr
+			var dstIP net.IPAddr
 			dstIP.IP = rcm.Dst
-			n := ndp{target: target, icmpType: rm.Type, dstIP: *dstIP, srcIP: *srcIP, payload: payload}
+			n := ndp{target: target, icmpType: rm.Type, dstIP: dstIP, srcIP: *srcIP, payload: payload}
 			// send data if we read some.
 			l.intChan <- n
 			vlog.Printf("%s\tread\t%s\tip6_src %s\tip6_dst %s\ttarget %s\n", l.ifname, n.icmpType, n.srcIP.IP, n.dstIP.IP, n.target)
