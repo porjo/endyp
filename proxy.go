@@ -300,6 +300,12 @@ func (l *listener) handler() {
 	}
 	defer handle.Close()
 
+	// limit captured packets to icmp6
+	err = handle.SetBPFFilter("icmp6")
+	if err != nil {
+		return
+	}
+
 	var iface *net.Interface
 	iface, err = net.InterfaceByName(l.ifname)
 	if err != nil {
@@ -318,6 +324,7 @@ func (l *listener) handler() {
 		case *net.IPNet:
 			if v.IP.IsLinkLocalUnicast() {
 				linklocal = v.IP
+				break
 			}
 		}
 	}
